@@ -105,11 +105,17 @@ class MainViewModel: ObservableObject {
     // MARK: - Timeline Management
     func addClipToTimeline(_ mediaItem: MediaItem, at time: TimeInterval, trackIndex: Int) {
         let clip = TimelineClip(mediaItem: mediaItem, startTime: time, trackIndex: trackIndex)
-        currentProject.timeline.addClip(clip)
+        // Add clip to appropriate track
+        if let track = currentProject.timeline.tracks.first(where: { $0.type == (clip.mediaItem.type == .video ? .video : .audio) }) {
+            track.clips.append(clip)
+        }
     }
     
     func removeClipFromTimeline(withId clipId: UUID) {
-        currentProject.timeline.removeClip(withId: clipId)
+        // Remove clip from all tracks
+        for track in currentProject.timeline.tracks {
+            track.clips.removeAll { $0.id == clipId }
+        }
         selectedTimelineClips.remove(clipId)
     }
     
@@ -117,7 +123,9 @@ class MainViewModel: ObservableObject {
         for trackIndex in currentProject.timeline.tracks.indices {
             if let clipIndex = currentProject.timeline.tracks[trackIndex].clips.firstIndex(where: { $0.id == clipId }) {
                 currentProject.timeline.tracks[trackIndex].clips[clipIndex].startTime = startTime
-                currentProject.timeline.updateDuration()
+                // Update project duration
+                let maxEndTime = currentProject.timeline.tracks.flatMap { $0.clips }.map { $0.endTime }.max() ?? 0
+                currentProject.timeline.duration = maxEndTime
                 break
             }
         }
@@ -157,7 +165,16 @@ class MainViewModel: ObservableObject {
         playbackTime = max(0, min(time, currentProject.timeline.duration))
     }
     
-    // MARK: - Timeline Operations
+    // MARK: - Enhanced Timeline Operations
+    func addTrack(type: TimelineTrack.TrackType) {
+        let newTrack = TimelineTrack(type: type)
+        currentProject.timeline.tracks.append(newTrack)
+    }
+    
+    func removeTrack(_ trackId: UUID) {
+        currentProject.timeline.tracks.removeAll { $0.id == trackId }
+    }
+    
     func addMediaToTimeline(url: URL, at time: TimeInterval) {
         let mediaItem = MediaItem(url: url)
         
@@ -167,36 +184,47 @@ class MainViewModel: ObservableObject {
             trackIndex: 0
         )
         
-        // Add to appropriate track based on media type
+        // Find appropriate track or create one
         let trackType: TimelineTrack.TrackType = mediaItem.type == .video ? .video : .audio
         
-        if let existingTrackIndex = currentProject.timeline.tracks.firstIndex(where: { $0.type == trackType }) {
-            currentProject.timeline.tracks[existingTrackIndex].clips.append(clip)
+        if let existingTrack = currentProject.timeline.tracks.first(where: { $0.type == trackType }) {
+            // Check for layer conflicts and assign appropriate layer
+            let conflictingClips = existingTrack.clips.filter { existingClip in
+                !(clip.endTime <= existingClip.startTime || clip.startTime >= existingClip.endTime)
+            }
+            
+            var layerIndex = 0
+            while conflictingClips.contains(where: { $0.layerIndex == layerIndex }) {
+                layerIndex += 1
+            }
+            
+            var newClip = clip
+            newClip.layerIndex = layerIndex
+            existingTrack.clips.append(newClip)
         } else {
-            var newTrack = TimelineTrack(type: trackType)
+            // Create new track
+            let newTrack = TimelineTrack(type: trackType)
             newTrack.clips.append(clip)
             currentProject.timeline.tracks.append(newTrack)
         }
-    }
-    
-    func addNewTrack() {
-        let newTrack = TimelineTrack(type: .video)
-        currentProject.timeline.tracks.append(newTrack)
+        
+        updateProjectDuration()
     }
     
     func removeClipFromTimeline(_ clipId: UUID) {
-        for i in 0..<currentProject.timeline.tracks.count {
-            currentProject.timeline.tracks[i].clips.removeAll { $0.id == clipId }
+        for track in currentProject.timeline.tracks {
+            track.clips.removeAll { $0.id == clipId }
         }
         selectedTimelineClips.remove(clipId)
+        updateProjectDuration()
     }
     
-    func moveClip(_ clipId: UUID, to time: TimeInterval, trackIndex: Int) {
+    func moveClip(_ clipId: UUID, to time: TimeInterval, track: TimelineTrack) {
         // Find and remove clip from current track
         var clipToMove: TimelineClip?
-        for i in 0..<currentProject.timeline.tracks.count {
-            if let clipIndex = currentProject.timeline.tracks[i].clips.firstIndex(where: { $0.id == clipId }) {
-                clipToMove = currentProject.timeline.tracks[i].clips.remove(at: clipIndex)
+        for currentTrack in currentProject.timeline.tracks {
+            if let clipIndex = currentTrack.clips.firstIndex(where: { $0.id == clipId }) {
+                clipToMove = currentTrack.clips.remove(at: clipIndex)
                 break
             }
         }
@@ -204,10 +232,27 @@ class MainViewModel: ObservableObject {
         // Add to new track at new time
         if var clip = clipToMove {
             clip.startTime = time
-            if trackIndex < currentProject.timeline.tracks.count {
-                currentProject.timeline.tracks[trackIndex].clips.append(clip)
+            
+            // Handle layer conflicts
+            let conflictingClips = track.clips.filter { existingClip in
+                !(clip.endTime <= existingClip.startTime || clip.startTime >= existingClip.endTime)
             }
+            
+            var layerIndex = 0
+            while conflictingClips.contains(where: { $0.layerIndex == layerIndex }) {
+                layerIndex += 1
+            }
+            clip.layerIndex = layerIndex
+            
+            track.clips.append(clip)
         }
+        
+        updateProjectDuration()
+    }
+    
+    private func updateProjectDuration() {
+        let maxEndTime = currentProject.timeline.tracks.flatMap { $0.clips }.map { $0.endTime }.max() ?? 0
+        currentProject.timeline.duration = maxEndTime
     }
     
     // MARK: - Enhanced Export System
@@ -359,14 +404,286 @@ class MainViewModel: ObservableObject {
         print("Generating AI voiceover for: \(text)")
     }
     
+
+    
+    // MARK: - AI Integration with Real APIs
+    private let openAIAPIKey = "sk-whatsapp-m4BOtm3wYwyDvL52JJgAT3BlbkFJf2jH4gz7Uck5yCaco1g5"
+    private let elevenLabsAPIKey = "fba155a7d2d56f47d00f9013447bac3a"
+    
+    @Published var isProcessingAI = false
+    @Published var aiProgress: Double = 0
+    @Published var currentAITask = ""
+    
+    func generateAutoCaptions() {
+        guard !isProcessingAI else { return }
+        
+        isProcessingAI = true
+        currentAITask = "Generating Captions"
+        aiProgress = 0
+        
+        Task {
+            do {
+                // Get video clips for transcription
+                let videoClips = currentProject.timeline.tracks
+                    .filter { $0.type == .video }
+                    .flatMap { $0.clips }
+                    .sorted { $0.startTime < $1.startTime }
+                
+                for (index, clip) in videoClips.enumerated() {
+                    await MainActor.run {
+                        aiProgress = Double(index) / Double(videoClips.count) * 0.8
+                    }
+                    
+                    // Extract audio and send to OpenAI Whisper
+                    let subtitles = try await transcribeAudio(from: clip)
+                    
+                    await MainActor.run {
+                        // Add subtitles to subtitle track
+                        addSubtitlesToTrack(subtitles, for: clip)
+                    }
+                }
+                
+                await MainActor.run {
+                    aiProgress = 1.0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.isProcessingAI = false
+                        self.currentAITask = ""
+                        self.aiProgress = 0
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isProcessingAI = false
+                    showError("Failed to generate captions: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+    
+    func generateVoiceover(text: String, voice: String = "alloy") {
+        guard !isProcessingAI else { return }
+        
+        isProcessingAI = true
+        currentAITask = "Generating Voiceover"
+        aiProgress = 0
+        
+        Task {
+            do {
+                let audioURL = try await generateTTSAudio(text: text, voice: voice)
+                
+                await MainActor.run {
+                    // Add generated audio to timeline
+                    addMediaToTimeline(url: audioURL, at: playbackTime)
+                    
+                    aiProgress = 1.0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.isProcessingAI = false
+                        self.currentAITask = ""
+                        self.aiProgress = 0
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isProcessingAI = false
+                    showError("Failed to generate voiceover: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+    
     func detectScenes() {
-        // Mock implementation - in real app would use Vision API
-        print("Detecting scenes in video...")
+        guard !isProcessingAI else { return }
+        
+        isProcessingAI = true
+        currentAITask = "Detecting Scenes"
+        aiProgress = 0
+        
+        Task {
+            do {
+                let videoClips = currentProject.timeline.tracks
+                    .filter { $0.type == .video }
+                    .flatMap { $0.clips }
+                
+                for (index, clip) in videoClips.enumerated() {
+                    await MainActor.run {
+                        aiProgress = Double(index) / Double(videoClips.count)
+                    }
+                    
+                    // Analyze video for scene changes
+                    let sceneMarkers = try await analyzeVideoScenes(clip: clip)
+                    
+                    await MainActor.run {
+                        // Add scene markers or auto-split clips
+                        processSceneMarkers(sceneMarkers, for: clip)
+                    }
+                }
+                
+                await MainActor.run {
+                    aiProgress = 1.0
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                        self.isProcessingAI = false
+                        self.currentAITask = ""
+                        self.aiProgress = 0
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    isProcessingAI = false
+                    showError("Failed to detect scenes: \(error.localizedDescription)")
+                }
+            }
+        }
     }
     
     func removeBackground() {
-        // Mock implementation - in real app would use Vision person segmentation
-        print("Removing background from video...")
+        guard !isProcessingAI else { return }
+        
+        isProcessingAI = true
+        currentAITask = "Removing Background"
+        aiProgress = 0
+        
+        // Mock implementation - would use AI background removal
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            self.aiProgress = 1.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                self.isProcessingAI = false
+                self.currentAITask = ""
+                self.aiProgress = 0
+            }
+        }
+    }
+    
+    // MARK: - AI API Integration Methods
+    private func transcribeAudio(from clip: TimelineClip) async throws -> [Subtitle] {
+        // Extract audio from video clip
+        let audioURL = try await extractAudio(from: clip.mediaItem.url)
+        
+        // Prepare request to OpenAI Whisper API
+        let url = URL(string: "https://api.openai.com/v1/audio/transcriptions")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(openAIAPIKey)", forHTTPHeaderField: "Authorization")
+        
+        // Create multipart form data
+        let boundary = UUID().uuidString
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        
+        var data = Data()
+        
+        // Add file
+        data.append("--\(boundary)\r\n".data(using: .utf8)!)
+        data.append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.m4a\"\r\n".data(using: .utf8)!)
+        data.append("Content-Type: audio/m4a\r\n\r\n".data(using: .utf8)!)
+        data.append(try Data(contentsOf: audioURL))
+        data.append("\r\n".data(using: .utf8)!)
+        
+        // Add model
+        data.append("--\(boundary)\r\n".data(using: .utf8)!)
+        data.append("Content-Disposition: form-data; name=\"model\"\r\n\r\n".data(using: .utf8)!)
+        data.append("whisper-1\r\n".data(using: .utf8)!)
+        
+        // Add response format
+        data.append("--\(boundary)\r\n".data(using: .utf8)!)
+        data.append("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n".data(using: .utf8)!)
+        data.append("verbose_json\r\n".data(using: .utf8)!)
+        
+        data.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        
+        request.httpBody = data
+        
+        let (responseData, _) = try await URLSession.shared.data(for: request)
+        
+        // Parse response and create subtitles
+        let response = try JSONSerialization.jsonObject(with: responseData) as? [String: Any]
+        let segments = response?["segments"] as? [[String: Any]] ?? []
+        
+        return segments.compactMap { segment in
+            guard let text = segment["text"] as? String,
+                  let start = segment["start"] as? Double,
+                  let end = segment["end"] as? Double else { return nil }
+            
+            return Subtitle(
+                text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+                startTime: clip.startTime + start,
+                endTime: clip.startTime + end
+            )
+        }
+    }
+    
+    private func generateTTSAudio(text: String, voice: String) async throws -> URL {
+        let url = URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voice)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(elevenLabsAPIKey, forHTTPHeaderField: "xi-api-key")
+        
+        let requestBody: [String: Any] = [
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": [
+                "stability": 0.5,
+                "similarity_boost": 0.5
+            ]
+        ]
+        
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+        
+        let (data, _) = try await URLSession.shared.data(for: request)
+        
+        // Save audio to temporary file
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voiceover_\(UUID().uuidString).mp3")
+        
+        try data.write(to: tempURL)
+        return tempURL
+    }
+    
+    private func extractAudio(from videoURL: URL) async throws -> URL {
+        // Use AVAssetExportSession to extract audio
+        let asset = AVAsset(url: videoURL)
+        let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A)!
+        
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("extracted_audio_\(UUID().uuidString).m4a")
+        
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        
+        await exportSession.export()
+        
+        if let error = exportSession.error {
+            throw error
+        }
+        
+        return outputURL
+    }
+    
+    private func analyzeVideoScenes(clip: TimelineClip) async throws -> [TimeInterval] {
+        // Mock scene detection - in real implementation would use AI
+        // Return timestamps where scene changes occur
+        let clipDuration = clip.duration
+        let numberOfScenes = Int(clipDuration / 10) + 1 // Scene every 10 seconds
+        
+        return stride(from: 0.0, to: clipDuration, by: 10.0).map { $0 }
+    }
+    
+    private func addSubtitlesToTrack(_ subtitles: [Subtitle], for clip: TimelineClip) {
+        // Find or create subtitle track
+        var subtitleTrack = currentProject.timeline.tracks.first { $0.type == .subtitle }
+        
+        if subtitleTrack == nil {
+            subtitleTrack = TimelineTrack(type: .subtitle)
+            currentProject.timeline.tracks.append(subtitleTrack!)
+        }
+        
+        // Add subtitles (this would need to be implemented based on how subtitles are stored)
+        // For now, we'll add them to the project's subtitle list
+        // This is a simplified implementation
+    }
+    
+    private func processSceneMarkers(_ markers: [TimeInterval], for clip: TimelineClip) {
+        // Process scene change markers - could auto-split clips or add markers
+        // Implementation depends on desired behavior
     }
     
     // MARK: - Error Handling

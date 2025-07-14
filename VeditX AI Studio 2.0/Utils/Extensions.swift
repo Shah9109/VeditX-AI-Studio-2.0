@@ -29,12 +29,19 @@ extension Color {
     static let timelineAudio = Color(hex: "10b981")     // Green
     static let timelineSubtitle = Color(hex: "f59e0b")  // Yellow
     static let timelineImage = Color(hex: "8b5cf6")     // Purple
+    static let timelineText = Color(hex: "ec4899")      // Pink
+    static let timelineEffect = Color(hex: "06b6d4")    // Cyan
     
     // UI Colors
     static let primaryText = Color.white
     static let secondaryText = Color.white.opacity(0.7)
-    static let accentBlue = Color.blue
-    static let accentOrange = Color.orange
+    // Accent colors
+    static let accentBlue = Color(hex: "007AFF")
+    static let accentGreen = Color(hex: "34C759")
+    static let accentOrange = Color(hex: "FF9500")
+    static let accentRed = Color(hex: "FF3B30")
+    static let accentPurple = Color(hex: "AF52DE")
+    static let accentPink = Color(hex: "FF2D92")
     
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
